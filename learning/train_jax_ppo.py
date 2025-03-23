@@ -151,6 +151,77 @@ def get_rl_config(env_name: str) -> config_dict.ConfigDict:
   raise ValueError(f"Env {env_name} not found in {registry.ALL_ENVS}.")
 
 
+def evaluate_and_save_video(
+    env,
+    make_inference_fn,
+    params,
+    iteration,
+    vision=False,
+    max_steps=1000,
+    wandb_log=True,
+    save_dir=".",
+):
+  """
+  Runs a single rollout, saves an MP4, and optionally uploads to W&B.
+  """
+  
+  if len(params) == 2:
+    # ppo/train.py in brax returns a different structure for params when calling policy_params_fn vs. the return value of train()
+    # in the main branch this is fixed, but not in the pip package yet as of v0.12.1 so manually fix it here
+    params = (params[0], params[1].policy, params[1].value)
+  inference_fn = make_inference_fn(params, deterministic=True)
+  jit_inference_fn = jax.jit(inference_fn)
+
+  jit_reset = jax.jit(env.reset)
+  jit_step = jax.jit(env.step)
+
+  # We create a new RNG for evaluation
+  rng = jax.random.PRNGKey(123)
+  rng, reset_rng = jax.random.split(rng)
+  if vision:
+    # If using vision, we might have multiple envs for parallel rendering
+    num_envs = env.num_envs if hasattr(env, 'num_envs') else 1
+    reset_rng = jp.asarray(jax.random.split(reset_rng, num_envs))
+
+  state = jit_reset(reset_rng)
+  # If vision: take the first env's state for storing frames
+  state0 = jax.tree_util.tree_map(lambda x: x[0], state) if vision else state
+
+  rollout_frames = [state0]
+  for _ in range(max_steps):
+    act_rng, rng = jax.random.split(rng)
+    ctrl, _ = jit_inference_fn(state.obs, act_rng)
+    state = jit_step(state, ctrl)
+    state0 = (
+        jax.tree_util.tree_map(lambda x: x[0], state) if vision else state
+    )
+    rollout_frames.append(state0)
+    if state0.done:
+      break
+
+  # Render frames
+  render_every = 2
+  fps = 1.0 / env.dt / render_every
+  traj = rollout_frames[::render_every]
+
+  scene_option = mujoco.MjvOption()
+  scene_option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = False
+  scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = False
+  scene_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = False
+
+  frames = env.render(traj, height=480, width=640, scene_option=scene_option)
+  out_filename = os.path.join(save_dir, "rollout.mp4")
+  media.write_video(out_filename, frames, fps=fps)
+
+  print(f"Saved rollout to {out_filename}.")
+
+  # Upload to W&B if desired
+  if wandb_log and wandb.run is not None:
+    wandb.log({"rollout_video": wandb.Video(out_filename, fps=fps)}, step=iteration)
+
+  return out_filename
+
+
 def main(argv):
   """Run training and evaluation for the specified environment."""
 
@@ -268,12 +339,25 @@ def main(argv):
   with open(ckpt_path / "config.json", "w", encoding="utf-8") as fp:
     json.dump(env_cfg.to_dict(), fp, indent=4)
 
-  # Define policy parameters function for saving checkpoints
+  # Define policy parameters function for saving checkpoints and rollout video
   def policy_params_fn(current_step, make_policy, params):  # pylint: disable=unused-argument
+    # 1) Save model checkpoint
     orbax_checkpointer = ocp.PyTreeCheckpointer()
     save_args = orbax_utils.save_args_from_target(params)
     path = ckpt_path / f"{current_step}"
     orbax_checkpointer.save(path, params, force=True, save_args=save_args)
+
+    # 2) Run evaluation rollout & save video each iteration
+    evaluate_and_save_video(
+        env=env,
+        make_inference_fn=make_policy,
+        params=params,
+        iteration=current_step,
+        vision=_VISION.value,
+        max_steps=ppo_params.episode_length,
+        wandb_log=_USE_WANDB.value,
+        save_dir=ckpt_path,
+    )
 
   training_params = dict(ppo_params)
   if "network_factory" in training_params:
@@ -361,62 +445,17 @@ def main(argv):
     print(f"Time to JIT compile: {times[1] - times[0]}")
     print(f"Time to train: {times[-1] - times[1]}")
 
-  print("Starting inference...")
-
-  # Create inference function
-  inference_fn = make_inference_fn(params, deterministic=True)
-  jit_inference_fn = jax.jit(inference_fn)
-
-  # Prepare for evaluation
-  num_envs = 1
-  if _VISION.value:
-    eval_env = env
-    num_envs = env_cfg.vision_config.render_batch_size
-
-  jit_reset = jax.jit(eval_env.reset)
-  jit_step = jax.jit(eval_env.step)
-
-  rng = jax.random.PRNGKey(123)
-  rng, reset_rng = jax.random.split(rng)
-  if _VISION.value:
-    reset_rng = jp.asarray(jax.random.split(reset_rng, num_envs))
-  state = jit_reset(reset_rng)
-  state0 = (
-      jax.tree_util.tree_map(lambda x: x[0], state) if _VISION.value else state
+  print("Running final inference rollout and saving video...")
+  evaluate_and_save_video(
+      env=env,
+      make_inference_fn=make_inference_fn,
+      params=params,
+      iteration=999999,  # or "final"
+      vision=_VISION.value,
+      max_steps=ppo_params.episode_length,
+      wandb_log=_USE_WANDB.value,
   )
-  rollout = [state0]
 
-  # Run evaluation rollout
-  for _ in range(env_cfg.episode_length):
-    act_rng, rng = jax.random.split(rng)
-    ctrl, _ = jit_inference_fn(state.obs, act_rng)
-    state = jit_step(state, ctrl)
-    state0 = (
-        jax.tree_util.tree_map(lambda x: x[0], state)
-        if _VISION.value
-        else state
-    )
-    rollout.append(state0)
-    if state0.done:
-      break
-
-  # Render and save the rollout
-  render_every = 2
-  fps = 1.0 / eval_env.dt / render_every
-  print(f"FPS for rendering: {fps}")
-
-  traj = rollout[::render_every]
-
-  scene_option = mujoco.MjvOption()
-  scene_option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = False
-  scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = False
-  scene_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = False
-
-  frames = eval_env.render(
-      traj, height=480, width=640, scene_option=scene_option
-  )
-  media.write_video("rollout.mp4", frames, fps=fps)
-  print("Rollout video saved as 'rollout.mp4'.")
 
 
 if __name__ == "__main__":
