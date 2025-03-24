@@ -82,6 +82,12 @@ _USE_WANDB = flags.DEFINE_boolean(
     False,
     "Use Weights & Biases for logging (ignored in play-only mode)",
 )
+_CAPTURE_VIDEO = flags.DEFINE_boolean(
+    "capture_video", False, "Do a rollout and save video on every iteration during evaluation (uploads to W&B if use_wandb is enabled)"
+)
+_CAPTURE_VIDEO_LEN = flags.DEFINE_integer(
+    "capture_video_len", 200, "Length of rollout for video capture"
+)
 _USE_TB = flags.DEFINE_boolean(
     "use_tb", False, "Use TensorBoard for logging (ignored in play-only mode)"
 )
@@ -151,7 +157,7 @@ def get_rl_config(env_name: str) -> config_dict.ConfigDict:
   raise ValueError(f"Env {env_name} not found in {registry.ALL_ENVS}.")
 
 
-def evaluate_and_save_video(
+def rollout_and_capture_video(
     env,
     make_inference_fn,
     params,
@@ -176,7 +182,7 @@ def evaluate_and_save_video(
   jit_step = jax.jit(env.step)
 
   # We create a new RNG for evaluation
-  rng = jax.random.PRNGKey(123)
+  rng = jax.random.PRNGKey(123 + iteration)
   rng, reset_rng = jax.random.split(rng)
   if vision:
     # If using vision, we might have multiple envs for parallel rendering
@@ -196,8 +202,6 @@ def evaluate_and_save_video(
         jax.tree_util.tree_map(lambda x: x[0], state) if vision else state
     )
     rollout_frames.append(state0)
-    if state0.done:
-      break
 
   # Render frames
   render_every = 2
@@ -347,17 +351,18 @@ def main(argv):
     path = ckpt_path / f"{current_step}"
     orbax_checkpointer.save(path, params, force=True, save_args=save_args)
 
-    # 2) Run evaluation rollout & save video each iteration
-    evaluate_and_save_video(
-        env=env,
-        make_inference_fn=make_policy,
-        params=params,
-        iteration=current_step,
-        vision=_VISION.value,
-        max_steps=ppo_params.episode_length,
-        wandb_log=_USE_WANDB.value,
-        save_dir=ckpt_path,
-    )
+    if _CAPTURE_VIDEO.value:
+      # 2) Run evaluation rollout & save video each iteration
+      rollout_and_capture_video(
+          env=env,
+          make_inference_fn=make_policy,
+          params=params,
+          iteration=current_step,
+          vision=_VISION.value,
+          max_steps=_CAPTURE_VIDEO_LEN.value,
+          wandb_log=_USE_WANDB.value,
+          save_dir=path,
+      )
 
   training_params = dict(ppo_params)
   if "network_factory" in training_params:
@@ -446,14 +451,14 @@ def main(argv):
     print(f"Time to train: {times[-1] - times[1]}")
 
   print("Running final inference rollout and saving video...")
-  evaluate_and_save_video(
+  rollout_and_capture_video(
       env=env,
       make_inference_fn=make_inference_fn,
       params=params,
       iteration=999999,  # or "final"
       vision=_VISION.value,
       max_steps=ppo_params.episode_length,
-      wandb_log=_USE_WANDB.value,
+      wandb_log=False,
   )
 
 
